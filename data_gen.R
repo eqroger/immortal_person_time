@@ -26,7 +26,7 @@ expit <- function(x) {1/(1+exp(-x))}
 ### Data generation
 ##
 n <- 1000 # Number of subjects
-N <- 9 #number of intervals per subject
+N <- 10 #number of intervals per subject
 K <- 1 # Number of causes of death
 
 ## This is the matrix of parameters of interest, possibly different
@@ -144,7 +144,7 @@ simulation <- function (exposure) {
 
 plot_dat <- simulation(exposure=NULL) %>% 
   mutate(first_exposure = as.numeric(A+ALast == 1),
-         last_id = as.numeric(Int==9|Z==1))
+         last_id = as.numeric(Int==10|Z==1))
 
 p0 <- plot_dat %>% 
   filter(A==0) %>% 
@@ -179,17 +179,20 @@ ggplot() +
              aes(x = max_time, 
                  y = ID, 
                  shape = factor(Z))) +
+  geom_vline(xintercept = 1, color = "black", linetype = "dashed") +
   theme_classic() + 
   # scale_x_continuous(expand=c(0,0)) +
   # scale_y_continuous(expand=c(0,0)) + 
   xlab("Time on Study")
 
 # create simulation to be used in analysis steps
-s <- 100
+s <- 50
 sim <- s
 all_res <- data.frame(Oracle = numeric(sim),
                       IPTW.PL = numeric(sim),
                       IPTW.COX = numeric(sim),
+                      CCW1 = numeric(sim),
+                      CCW2 = numeric(sim),
                       IPTW.TF1 = numeric(sim),
                       IPTW.TF2 = numeric(sim))
 start <- Sys.time()
@@ -232,8 +235,97 @@ for (i in 1:sim){
   all_res[i, "IPTW.COX"] <- coef(iptw.cox)[1]
   
   ###################################################
-  ## Clone-Censor-Weighting Estimator
+  ## Clone-Censor-Weighting Estimator: Approach 1
   ###################################################
+  #Clone just those with a change in treatment from unexposed to exposed (0 to 1), 
+      #create a clone that is set to 1 at all times prior to the interval where treatment(0-->1) (IDA)
+  d_0 <- d %>% filter(Int == 1 & A == 0)
+  
+  d_clone01 <- d %>% filter(ID %in% d_0$ID) %>%
+    group_by(ID) %>%
+    mutate(Asum = cumsum(A),
+           T01 = if_else(Asum == 1, Int, NA)) %>%   #T01 is the interval where treatment flips from 0 to 1
+    filter(!is.na(T01)) %>% 
+    select(ID, T01) %>%
+    ungroup() %>%
+    left_join(d, by = "ID") %>% #merge back to original data
+    mutate(AClone = if_else(Int < T01, 1, A),
+           IDClone = paste0(ID, "A"),
+           ZClone = Z)
+  
+  #Generate clone & censored data (duplicate above, but when interval T01 is reached, censor)
+  d_clone00 <- d_clone01 %>%
+    group_by(ID) %>%
+    filter(Int <= T01) %>%
+    mutate(AClone = 0,
+           IDClone = paste0(ID, "B"),
+           ZClone = if_else(row_number()==n(), 2, ZClone)) %>%
+    ungroup()
+  
+  #Bind data together
+  d_cloned <- bind_rows(d_clone01, d_clone00)
+  
+  d_not_cloned <- d %>% filter(!(ID %in% d_cloned$ID)) %>%
+    mutate(ZClone = Z)
+  
+  d_cloned_full <- bind_rows(d_cloned, d_not_cloned)
+  
+  d_cloned <- d_cloned_full %>% mutate(AClone = if_else(is.na(AClone), A, AClone),
+                                  ACloneLast = lag(AClone),
+                                  ACloneLast = if_else(is.na(ACloneLast), AClone, ACloneLast),
+                                  event = if_else(ZClone == 2, 0,
+                                                  if_else(ZClone == 0, 1, 2)),
+                                  censor = if_else(ZClone == 2, 1, 0),
+                                  death = if_else(ZClone == 1, 1, 0),
+                                  IDClone = if_else(is.na(IDClone), paste0(ID, "A"), IDClone))
+  
+  #Inverse probability of censoring weighting analysis
+  
+  d_cloned$den_d <- glm((censor==0) ~ AClone + ACloneLast + L + LLast + as.factor(Int), family=binomial(link="logit"), data=d_cloned)$fitted.values
+  
+  d_cloned$num_d <- glm((censor==0) ~ as.factor(Int), 
+                        family=binomial(link="logit"), data=d_cloned)$fitted.values
+  
+  
+  # Build time-specific weights
+  # wt=0 when someone is censored
+  d_cloned$wt_d <- ifelse(d_cloned$censor==1, 0, d_cloned$num_d/d_cloned$den_d)
+  
+  # Multiply censoring weights across time
+  d_cloned <- d_cloned %>% 
+    group_by(IDClone) %>%  
+    mutate(cum_wt=cumprod(wt_d)) %>% 
+    ungroup(IDClone) 
+
+  d_cloned <- d_cloned %>% filter(cum_wt > 0)
+  
+  # Analysis applying censoring weights
+  ipcw.cox <- coxph(Surv(Int0, Tv, death)  ~ AClone + ACloneLast, data=d_cloned, weights=cum_wt, ties="efron", timefix=FALSE)
+  
+  all_res[i, "CCW1"] <- coef(ipcw.cox)[1]
+  
+  ###################################################
+  ## Clone-Censor-Weighting Estimator: Approach 2
+  ###################################################
+  # assumes that the immortal person time is fixed for everyone (i.e. all time prior to interval 1 is misclassified)
+  d_cloned <- d %>% filter(Int == 1)
+  d_cloned <- d_cloned %>% mutate(AClone = if_else(A == 0, 1,
+                                             if_else(A == 1, 0, NA)),
+                            ZClone = if_else(Z == 0, 2, Z),
+                            IDclone = paste0(ID, "B"))
+  
+  d_cloned <- bind_rows(d, d_cloned)
+  
+  d_cloned <- d_cloned %>% mutate(AClone = if_else(is.na(AClone), A, AClone)) %>%
+    group_by(IDclone) %>%
+    mutate(ACloneLast = lag(AClone),
+                                  ACloneLast = if_else(is.na(ACloneLast), AClone, ACloneLast),
+                                  ZClone = if_else(is.na(ZClone), Z, ZClone),
+                                  death = if_else(ZClone == 1, 1, 0),
+                                  censor = if_else(ZClone == 2, 1, 0),
+                                  IDclone = if_else(is.na(IDclone), paste0(ID, "A"), IDclone)) %>%
+    ungroup()
+  
   #T01 is the interval where treatment flips from 0 to 1
   d_clone01 <- d %>%
     group_by(ID) %>%
@@ -246,7 +338,7 @@ for (i in 1:sim){
     mutate(AClone = if_else(Int < T01, 1, A),
            IDClone = paste0(ID, "A"),
            ZClone = Z)
-  
+
   #Generate clone & censored data
   d_clone00 <- d_clone01 %>%
     group_by(ID) %>%
@@ -255,18 +347,19 @@ for (i in 1:sim){
            IDClone = paste0(ID, "B"),
            ZClone = if_else(row_number()==n(), 2, ZClone)) %>%
     ungroup()
-  
+
   #Bind data together
   d_cloned <- bind_rows(d_clone01, d_clone00)
- 
-  d_cloned <- d_cloned %>% mutate(AClone = if_else(is.na(AClone), A, AClone),
-                                  ACloneLast = lag(AClone),
+
+  d_cloned <- d_cloned %>% mutate(AClone = if_else(is.na(AClone), A, AClone)) %>%
+  group_by(IDClone) %>%
+                                  mutate(ACloneLast = lag(AClone),
                                   ACloneLast = if_else(is.na(ACloneLast), AClone, ACloneLast),
                                   event = if_else(ZClone == 2, 0,
                                                   if_else(ZClone == 0, 1, 2)),
                                   censor = if_else(ZClone == 2, 1, 0),
                                   death = if_else(ZClone == 1, 1, 0))
-  
+
   #Inverse probability of censoring weighting analysis
 
   d_cloned$den_d <- glm((censor==0) ~ AClone + ACloneLast + L + LLast + as.factor(Int), family=binomial(link="logit"), data=d_cloned)$fitted.values
@@ -285,8 +378,12 @@ for (i in 1:sim){
     mutate(cum_wt=cumprod(wt_d)) %>% 
     ungroup(IDClone) 
   
+  d_cloned <- d_cloned %>% filter(cum_wt > 0)
   # Analysis applying censoring weights
+  iptw.pl <- suppressWarnings(glm(death ~ AClone + ACloneLast + as.factor(Int), data=d_cloned, family=binomial(link="logit"), weights=cum_wt))
   ipcw.cox <- coxph(Surv(Int0, Tv, death)  ~ AClone + ACloneLast, data=d_cloned, weights=cum_wt, ties="efron", timefix=FALSE)
+  
+  all_res[i, "CCW2"] <- coef(ipcw.cox)[1]
   
   ###################################################
   ## Time-Fixed 
@@ -361,33 +458,29 @@ for (i in 1:sim){
   
   iptw.cox <- coxph(Surv(min_time, max_time, Z)  ~ A, data=d2_tf, weights=sw, ties="efron", timefix=FALSE)
   all_res[i, "IPTW.TF2"] <- coef(iptw.cox)[1]
+  #robust variance code for iptw.cox notes
+  #add bootstrap function for the robust variance estimators
 }
 
 end <- Sys.time()
 
 run_time <- end-start
 
-#14.8 sec for 100 iterations
-#30.35 sec for 200 iterations
-#60 sec for 400 iterations 
-#118 sec for 800 iterations
-
-#15 sec / 100 iterations ~ 11 mins per run
-
 #Summarize over simulations
 res.sum <- data.frame(
-  method = c("Truth", "Oracle", "Cox MSM", "Time-Fixed 1", "Time-Fixed 2"),
-  average = rep(NA, 5), 
-  bias = rep(NA, 5),
-  mse = rep(NA, 5))
+  method = c("Truth", "Oracle", "Cox MSM", "CCW1", "CCW2", "Time-Fixed 1", "Time-Fixed 2"),
+  average = rep(NA, 7), 
+  bias = rep(NA, 7),
+  mse = rep(NA, 7))
 
 res.sum <- res.sum %>%
   mutate(
     average = case_when(
       method == "Truth" ~ log(1),
       method == "Oracle" ~ mean(all_res$Oracle),
-      method == "Pooled Logistic" ~ mean(all_res$IPTW.PL),
       method == "Cox MSM" ~ mean(all_res$IPTW.COX),
+      method == "CCW1" ~ mean(all_res$CCW1),
+      method == "CCW2" ~ mean(all_res$CCW2),
       method == "Time-Fixed 1" ~ mean(all_res$IPTW.TF1),
       method == "Time-Fixed 2" ~ mean(all_res$IPTW.TF2),
       TRUE ~ NA_real_  
@@ -396,8 +489,9 @@ res.sum <- res.sum %>%
     bias = average - log(1),
     sd = case_when(
       method == "Oracle" ~ sd(all_res$Oracle),
-      method == "Pooled Logistic" ~ sd(all_res$IPTW.PL),
       method == "Cox MSM" ~ sd(all_res$IPTW.COX),
+      method == "CCW1" ~ sd(all_res$CCW1),
+      method == "CCW2" ~ sd(all_res$CCW2),
       method == "Time-Fixed 1" ~ sd(all_res$IPTW.TF1),
       method == "Time-Fixed 2" ~ sd(all_res$IPTW.TF2),
       TRUE ~ NA_real_  
